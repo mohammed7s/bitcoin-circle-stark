@@ -87,6 +87,17 @@ mod test {
     use rand::{Rng, RngCore, SeedableRng};
     use rand_chacha::ChaCha20Rng;
     use rust_bitcoin_m31::qm31_equalverify;
+    //p2tr relates
+    use bitcoin::key::UntweakedPublicKey;
+    use bitcoin::taproot::{LeafVersion, TaprootBuilder};
+    use bitcoin::{
+        Amount, OutPoint, Script, ScriptBuf, Sequence, TxIn, TxOut, Witness, WitnessProgram,
+    };
+    use bitcoin::transaction::Version;
+    use bitcoin::absolute::LockTime;
+    use bitcoin_simulator::spending_requirements::{P2TRChecker};
+    use std::str::FromStr;
+
 
     #[test]
     fn test_merkle_tree_verify() {
@@ -121,8 +132,88 @@ mod test {
                 OP_TRUE
             };
 
-            let exec_result = execute_script(script);
-            assert!(exec_result.success);
+            //let exec_result = execute_script(script);
+            //assert!(exec_result.success);
+
+            // split the script to scriptpubkey and sig 
+
+            let script_pub_key = script! {
+                { merkle_tree.root_hash.to_vec() }
+                { pos }
+                { verify_script.clone() }
+                { last_layer[pos as usize] }
+                qm31_equalverify
+                OP_TRUE
+            }; 
+
+            let script_sig = script! {
+                { MerkleTreeGadget::push_merkle_tree_proof(&proof) }
+            }; 
+
+            // add p2tr test from bitcoin-simulator 
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            let internal_key = UntweakedPublicKey::from(
+                bitcoin::secp256k1::PublicKey::from_str(
+                    "0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+                )
+                .unwrap(),
+            );
+    
+    
+            // let script = script! {
+            //     { 1234 } OP_EQUAL
+            // };
+    
+            let taproot_builder = TaprootBuilder::new().add_leaf(0, script_pub_key.clone().into()).unwrap();
+            let taproot_spend_info = taproot_builder.finalize(&secp, internal_key).unwrap();
+    
+            let witness_program =
+                WitnessProgram::p2tr(&secp, internal_key, taproot_spend_info.merkle_root());
+    
+            let output = TxOut {
+                value: Amount::from_sat(1_000_000_000),
+                script_pubkey: ScriptBuf::new_witness_program(&witness_program),
+            };
+    
+            let tx = bitcoin::Transaction {
+                version: Version(1),
+                lock_time: LockTime::ZERO,
+                input: vec![],
+                output: vec![output.clone()],
+            };
+    
+            let tx_id = tx.compute_txid();
+    
+            let mut control_block_bytes = Vec::new();
+            taproot_spend_info
+                .control_block(&(script_pub_key.clone().into(), LeafVersion::TapScript))
+                .unwrap()
+                .encode(&mut control_block_bytes)
+                .unwrap();
+    
+            let mut witness = Witness::new();
+            witness.push(script_sig.to_bytes());
+            witness.push(script_pub_key.to_bytes());
+            witness.push(control_block_bytes);
+    
+            let input = TxIn {
+                previous_output: OutPoint::new(tx_id, 0),
+                script_sig: ScriptBuf::default(),
+                sequence: Sequence::MAX,
+                witness,
+            };
+    
+            let tx2 = bitcoin::Transaction {
+                version: Version(1),
+                lock_time: LockTime::ZERO,
+                input: vec![input.clone()],
+                output: vec![],
+            };
+    
+            let res = P2TRChecker::check(&tx2, &[output], 0);
+            assert!(res.is_ok());
+ 
+
         }
     }
 
